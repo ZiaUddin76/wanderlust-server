@@ -2,6 +2,7 @@ import express from 'express'
 import { MongoClient, ObjectId } from 'mongodb';
 import 'dotenv/config'
 import cors from "cors"
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const app = express()
 const PORT = process.env.PORT || 8000;
@@ -12,9 +13,7 @@ app.use(express.json())
 
 // Allow the deployed frontend plus any extra origin configured via env.
 const allowedOrigins = [
-  process.env.FRONTEND_URL,
-  'https://wanderlust-mocha-two.vercel.app',
-  'http://localhost:3000',
+  process.env.CLIENT_URL
 ].filter(Boolean)
 
 app.use(cors({
@@ -41,6 +40,48 @@ const db = mongoClient.db("wanderlust");
 const destinationCollection = db.collection("destination")
 const bookingCollection = db.collection("bookings")
 
+// The JWKS must come from the better-auth app hosting /api/auth/jwks.
+// The old hardcoded  breaks as soon as the
+// backend runs anywhere else (deploy, CI, another machine).
+
+const JWKS = createRemoteJWKSet(
+  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
+)
+
+
+
+const verifyToken = async (req, res, next) => {
+
+  const authHeader = req.headers.authorization;
+  // console.log(authHeader);
+
+  if (!authHeader) {
+    return res.status(401).send({ msg: 'Unauthorized' })
+  }
+
+  const token = authHeader.split(" ")[1]
+
+  if (!token) {
+    return res.status(401).send({ msg: 'Unauthorized' })
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, JWKS)
+    // Handlers below use the verified claims (e.g. the user's email) so a
+    // client can only ever act on its own session's data.
+    req.auth = payload
+    next();
+  }
+  catch (error) {
+    console.error('JWT verification failed:', error);
+    return res.status(401).send({ msg: 'Unauthorized — invalid or expired token.' });
+  }
+
+};
+
+
+
+
 
 /** Runs an async route handler and turns thrown errors into JSON 500s. */
 const wrap = (handler) => (req, res) => {
@@ -59,18 +100,20 @@ function parseObjectId(id) {
 
 // ---------- Destinations ----------
 
-app.post('/add-destination', wrap(async (req, res) => {
-  const data = { ...req.body }
-  // _id is immutable — never trust a client-supplied value.
-  delete data._id
+app.post('/add-destination',
+  verifyToken,
+  wrap(async (req, res) => {
+    const data = { ...req.body }
+    // _id is immutable — never trust a client-supplied value.
+    delete data._id
 
-  if (!data.destinationName) {
-    return res.status(400).json({ message: "destinationName is required." })
-  }
+    if (!data.destinationName) {
+      return res.status(400).json({ message: "destinationName is required." })
+    }
 
-  const result = await destinationCollection.insertOne(data)
-  res.status(201).json({ result });
-}))
+    const result = await destinationCollection.insertOne(data)
+    res.status(201).json({ result });
+  }))
 
 
 app.get('/destinations', wrap(async (req, res) => {
@@ -79,25 +122,46 @@ app.get('/destinations', wrap(async (req, res) => {
 }))
 
 
-app.get('/destinations/:id', wrap(async (req, res) => {
-  const { id } = req.params;
-  const objectId = parseObjectId(id)
 
-  if (!objectId) {
-    return res.status(400).json({ message: "Invalid destination id." })
-  }
-
-  const result = await destinationCollection.findOne({ _id: objectId })
-
-  if (!result) {
-    return res.status(404).json({ message: "Destination not found." })
-  }
-
+app.get('/featured-destination', wrap(async (req, res) => {
+  // Sort by `_id` so the newest packages lead — without a sort the 5
+  // "featured" ones would be whichever documents the cursor happens to see first.
+  const result = await destinationCollection
+    .find()
+    .sort({ _id: -1 })
+    .limit(5)
+    .toArray()
   res.send(result)
 }))
 
 
-app.patch('/destinations/:id', wrap(async (req, res) => {
+
+
+app.get('/destinations/:id',
+  verifyToken,
+  wrap(async (req, res) => {
+
+    const { id } = req.params;
+    const objectId = parseObjectId(id)
+
+    if (!objectId) {
+      return res.status(400).json({ message: "Invalid destination id." })
+    }
+
+    const result = await destinationCollection.findOne({ _id: objectId })
+
+    if (!result) {
+      return res.status(404).json({ message: "Destination not found." })
+    }
+
+    res.send(result)
+  }))
+
+
+app.patch('/destinations/:id',
+  verifyToken,
+  wrap(async (req, res) => {
+
   const { id } = req.params
   const objectId = parseObjectId(id)
 
@@ -117,7 +181,9 @@ app.patch('/destinations/:id', wrap(async (req, res) => {
 }))
 
 
-app.delete('/destination/:id', wrap(async (req, res) => {
+app.delete('/destination/:id',
+  verifyToken,
+  wrap(async (req, res) => {
   const { id } = req.params
   const objectId = parseObjectId(id)
 
@@ -132,27 +198,31 @@ app.delete('/destination/:id', wrap(async (req, res) => {
 
 // ---------- Bookings ----------
 
-app.post('/booking', wrap(async (req, res) => {
+app.post('/booking',
+  verifyToken,
+  wrap(async (req, res) => {
   const data = req.body
 
-  // Store only known fields, and never copy the destination's `_id` into
+  // Only known fields, and never copy the destination's `_id` into
   // the bookings collection — every booking needs its own unique id.
+  // Identity comes from the verified JWT, never from the request body —
+  // a client cannot book with (or forge) somebody else's email.
   const bookingDoc = {
     destinationId: String(data.destinationId ?? data._id ?? ""),
     destinationName: String(data.destinationName ?? data.name ?? ""),
     imageUrl: String(data.imageUrl ?? ""),
     price: Number(data.price) || 0,
     departureDate: String(data.departureDate ?? ""),
-    username: String(data.username ?? ""),
-    email: String(data.email ?? "").trim(),
-    userImage: String(data.image ?? ""),
+    username: String(req.auth.name ?? ""),
+    email: String(req.auth.email ?? "").trim(),
+    userImage: String(req.auth.image ?? ""),
     status: "confirmed",
     bookingDate: new Date(),
   }
 
   if (!bookingDoc.email) {
-    return res.status(400).json({
-      message: "You must be logged in to make a booking.",
+    return res.status(401).json({
+      message: "The verified token does not carry a usable email address.",
     })
   }
 
@@ -167,30 +237,56 @@ app.post('/booking', wrap(async (req, res) => {
 }))
 
 
-app.get('/my-bookings/:email', wrap(async (req, res) => {
-  const { email } = req.params
+app.get('/my-bookings/:email',
+  verifyToken,
+  wrap(async (req, res) => {
+    const { email } = req.params
 
-  // Express has already URL-decoded the path parameter once.
-  const result = await bookingCollection
-    .find({ email })
-    .toArray()
+    // IDOR guard: the email in the path must belong to the token's owner,
+    // otherwise anyone could enumerate another user's bookings.
+    if (!req.auth.email || req.auth.email.toLowerCase() !== email.toLowerCase()) {
+      return res.status(403).json({
+        message: "You can only view your own bookings.",
+      })
+    }
 
-  res.send(result)
-}))
+    // Express has already URL-decoded the path parameter once.
+    const result = await bookingCollection
+      .find({ email: req.auth.email })
+      .toArray()
+
+    res.send(result)
+  }))
 
 
-app.delete('/mybookings/:id', wrap(async (req, res) => {
-  const { id } = req.params
-  const objectId = parseObjectId(id)
+app.delete('/mybookings/:id',
+  verifyToken,
+  wrap(async (req, res) => {
+    const { id } = req.params
+    const objectId = parseObjectId(id)
 
-  if (!objectId) {
-    return res.status(400).json({ message: "Invalid booking id." })
-  }
+    if (!objectId) {
+      return res.status(400).json({ message: "Invalid booking id." })
+    }
 
-  // `_id` values are ObjectIds — a plain string would never match.
-  const result = await bookingCollection.deleteOne({ _id: objectId })
-  res.send(result)
-}))
+    // `_id` values are ObjectIds — a plain string would never match.
+    const booking = await bookingCollection.findOne({ _id: objectId })
+
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found." })
+    }
+
+    // Ownership guard: a valid token for another user must not cancel
+    // someone else's booking.
+    if (!req.auth.email || booking.email !== req.auth.email) {
+      return res.status(403).json({
+        message: "You can only cancel your own bookings.",
+      })
+    }
+
+    const result = await bookingCollection.deleteOne({ _id: objectId })
+    res.send(result)
+  }))
 
 
 app.get('/', (req, res) => {
